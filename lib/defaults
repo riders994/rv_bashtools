@@ -1,0 +1,56 @@
+# Default settings shared across all script categories. Source this file to load them.
+
+DEFAULT_LOG_DIR="${HOME}/.local/share/rv_bashtools/logs"
+DEFAULT_LOG_LEVEL="info"
+
+# my aliases
+alias gco='git checkout'
+alias gcn='git checkout -b'
+alias gitc='git commit -m'
+alias gc='git commit'
+alias gits='git status'
+alias gita='git add .'
+alias gitm='git merge'
+alias home='cd ~'
+alias jup='jupyter notebook'
+alias gp='git push'
+alias gitd='git branch -D'
+alias venv='source .venv/bin/activate'
+alias pm='python3 -m'
+alias pippy='pm pip install --upgrade'
+alias pypi_publish='deactivate; venv && rm -rf dist/ build/ *.egg-info/ && python -m build && twine upload dist/*'
+alias pilogin="ssh -p 50314 'piders994@thegoldenunasinn'"
+
+
+alias emove='home && cd activity/ && cp eloSystem/resources/elos/seasonal_elos_2.csv NBAEloGraphs/seasonal_elos_2.csv && cp eloSystem/resources/elos/dynasty_elos.csv NBAEloGraphs/dynasty_elos.csv && home'
+export PATH="$HOME/.local/bin:$PATH"
+
+# my functions
+rebase_all() { local current=$(git branch --show-current); git fetch origin && git branch --format '%(refname:short)' | grep -v '^primary$' | while read -r b; do git checkout "$b" && git rebase origin/primary; done; git checkout "$current"; }
+retag() {
+  local tag="$1"
+
+  if [[ -z "$tag" ]]; then
+    echo "Usage: retag <tag-name>" >&2
+    return 1
+  fi
+
+  git tag -d "$tag" 2>/dev/null
+  git tag "$tag" HEAD && git push --force origin "$tag"
+}
+
+alias retag-stable='retag stable'
+alias retag-dev='retag dev'
+alias retag-major='retag major'
+alias retag-fresh='retag fresh'
+# ssh fix?
+if [ -z "$SSH_AUTH_SOCK" ]; then
+  eval "$(ssh-agent -s)"
+  ssh-add ~/.ssh/id_rsa
+fi
+
+
+if [ -z "$SSH_AUTH_SOCK" ]; then
+  eval "$(ssh-agent -s)"
+  ssh-add ~/.ssh/id_ed25519
+fi

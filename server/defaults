@@ -1,0 +1,6 @@
+# Default settings for server scripts. Source this file to load them.
+
+DEFAULT_SSH_PORT=22
+DEFAULT_TIMEZONE="UTC"
+DEFAULT_ADMIN_USER=""
+DEFAULT_FIREWALL_ALLOWED_PORTS=(22 80 443)

@@ -1,0 +1,7 @@
+# Default settings for vm scripts. Source this file to load them.
+
+DEFAULT_VM_NAME="vm"
+DEFAULT_VM_CPUS=2
+DEFAULT_VM_MEMORY_MB=2048
+DEFAULT_VM_DISK_GB=20
+DEFAULT_VM_IMAGE=""

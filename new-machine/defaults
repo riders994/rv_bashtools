@@ -1,0 +1,5 @@
+# Default settings for new-machine scripts. Source this file to load them.
+
+DEFAULT_SHELL="/bin/bash"
+DEFAULT_PACKAGES=(git curl vim tmux htop)
+DEFAULT_DOTFILES_REPO=""
