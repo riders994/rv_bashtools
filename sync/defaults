@@ -1,0 +1,23 @@
+# Default settings for sync scripts. Source this file to load them.
+
+: "${DEFAULT_LOG_DIR:=${HOME}/.local/share/rv_bashtools/logs}"
+: "${DEFAULT_LOG_LEVEL:=info}"
+
+# registry location. empty means "next to this file", i.e. sync/registry/.
+# override per-machine in rsync-jobs.conf or with RV_SYNC_* in the environment.
+DEFAULT_SYNC_REGISTRY_DIR=""
+DEFAULT_SYNC_HOSTS_FILE=""
+DEFAULT_SYNC_JOBS_FILE=""
+
+DEFAULT_SYNC_LOG_DIR="${DEFAULT_LOG_DIR}/sync"
+DEFAULT_SYNC_WORKERS=4
+DEFAULT_SYNC_HOST_ROLE="both"
+DEFAULT_SYNC_SSH_PORT=""
+DEFAULT_SYNC_RSYNC="rsync"
+
+# rsync exit codes treated as success. 24 is "some source files vanished
+# during transfer", which is routine on a live tree.
+DEFAULT_SYNC_OK_EXIT_CODES=(0 24)
+
+# seconds to wait after SIGTERM before SIGKILL when interrupted
+DEFAULT_SYNC_KILL_GRACE=5

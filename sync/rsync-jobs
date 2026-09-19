@@ -1,0 +1,909 @@
+#!/usr/bin/env bash
+# rsync-jobs — register hosts and rsync jobs, then run them singly or in bulk.
+#
+# Deliberately not `set -e`: with a worker pool, wait and kill -0 returning
+# non-zero is normal control flow, and errexit would turn that into a silent
+# early exit.
+set -uo pipefail
+
+# resolve symlinks, so the tool still finds lib/ when linked into ~/.local/bin
+SELF="${BASH_SOURCE[0]}"
+while [[ -L "${SELF}" ]]; do
+  SELF_DIR="$(cd -P -- "$(dirname -- "${SELF}")" && pwd)"
+  SELF="$(readlink -- "${SELF}")"
+  [[ "${SELF}" != /* ]] && SELF="${SELF_DIR}/${SELF}"
+done
+SCRIPT_DIR="$(cd -P -- "$(dirname -- "${SELF}")" && pwd)"
+source "${SCRIPT_DIR}/defaults"
+source "${SCRIPT_DIR}/../lib/logging"
+source "${SCRIPT_DIR}/../lib/rsync-registry"
+source "${SCRIPT_DIR}/../lib/parallel"
+# per-machine overrides. deliberately does NOT source lib/defaults, which is an
+# interactive rc fragment: it spawns ssh-agent and would leak one per run.
+if [[ -r "${SCRIPT_DIR}/rsync-jobs.conf" ]]; then
+  source "${SCRIPT_DIR}/rsync-jobs.conf"
+fi
+
+# settings precedence: cli flag > RV_SYNC_* env > rsync-jobs.conf > defaults
+SYNC_REGISTRY_DIR="${RV_SYNC_REGISTRY_DIR:-${DEFAULT_SYNC_REGISTRY_DIR:-${SCRIPT_DIR}/registry}}"
+SYNC_HOSTS_FILE="${RV_SYNC_HOSTS_FILE:-${DEFAULT_SYNC_HOSTS_FILE:-${SYNC_REGISTRY_DIR}/hosts}}"
+SYNC_JOBS_FILE="${RV_SYNC_JOBS_FILE:-${DEFAULT_SYNC_JOBS_FILE:-${SYNC_REGISTRY_DIR}/jobs}}"
+SYNC_LOG_DIR="${RV_SYNC_LOG_DIR:-${DEFAULT_SYNC_LOG_DIR}}"
+SYNC_WORKERS="${RV_SYNC_WORKERS:-${DEFAULT_SYNC_WORKERS}}"
+SYNC_RSYNC="${RV_SYNC_RSYNC:-${DEFAULT_SYNC_RSYNC}}"
+SYNC_KILL_GRACE="${RV_SYNC_KILL_GRACE:-${DEFAULT_SYNC_KILL_GRACE}}"
+SYNC_OK_EXIT_CODES=("${DEFAULT_SYNC_OK_EXIT_CODES[@]}")
+LOG_LEVEL="${RV_SYNC_LOG_LEVEL:-${DEFAULT_LOG_LEVEL}}"
+LOG_FILE=""
+
+PROG="$(basename -- "${BASH_SOURCE[0]}")"
+
+# run-scoped state, set by cmd_run
+RUN_DIR=""
+LOCK_DIR=""
+DRY_RUN=0
+VERBOSE=0
+FAIL_FAST=0
+SELECTED_NAMES=()
+
+usage() {
+  cat >&2 <<'USAGE'
+Usage: rsync-jobs <command> [options]
+
+Hosts
+  host add NAME [--role both|send|recv] [--user USER] [--address ADDR]
+                [--port PORT] [--ssh-opts "OPTS"]
+  host list [--role ROLE] [--format table|raw]
+  host show NAME
+  host rm NAME [--force]            # --force required if jobs reference it
+
+Jobs
+  job add --name N --src HOST:PATH --dst HOST:PATH [--opts "FLAGS"] [--tags a,b]
+  job add --string 'name|src_host:path|dst_host:path|opts|tags'
+  job add --string -                # read one record from stdin
+  job add --stdin                   # bulk import, one record per line
+  job list [--tag TAG]... [--format table|raw]
+  job show NAME
+  job rm NAME
+
+Running
+  validate [NAME...] [--tag TAG]... # parse and check only, never runs rsync
+  run all [options]
+  run NAME [NAME...] [options]
+  run --tag TAG [--tag TAG]... [options]
+
+Run options
+  -j, --jobs N      concurrent workers (1 = serial)
+  -n, --dry-run     pass -n to rsync
+      --yes         required when a selected job deletes at the destination
+      --fail-fast   stop launching new jobs after the first failure
+      --log-dir DIR override the log root for this run
+      --force       run even if the registry has unparseable lines
+  -v, --verbose     mirror job output to stderr (implies -j 1)
+
+  help              this message
+
+A job string must be single-quoted: '|' is the field separator and the shell
+would otherwise read it as a pipeline. 'local' is a reserved pseudo-host meaning
+a plain filesystem path. rsync cannot transfer between two remote hosts, so one
+side of every job must be local.
+
+Exit codes: 0 all ok, 1 one or more jobs failed, 2 usage or validation error,
+130 interrupted.
+USAGE
+}
+
+die() {
+  log_error "$@"
+  exit 2
+}
+
+need_value() {
+  if (( $# < 2 )); then
+    die "option '$1' needs a value"
+  fi
+}
+
+# --------------------------------------------------------------------- hosts
+
+cmd_host_add() {
+  local name="" role="${DEFAULT_SYNC_HOST_ROLE}" user="" address=""
+  local port="${DEFAULT_SYNC_SSH_PORT}" ssh_opts="" record
+
+  while (( $# )); do
+    case "$1" in
+      --role)     need_value "$@"; role="$2"; shift 2 ;;
+      --user)     need_value "$@"; user="$2"; shift 2 ;;
+      --address)  need_value "$@"; address="$2"; shift 2 ;;
+      --port)     need_value "$@"; port="$2"; shift 2 ;;
+      --ssh-opts) need_value "$@"; ssh_opts="$2"; shift 2 ;;
+      -h|--help)  usage; return 0 ;;
+      --)         shift; break ;;
+      -*)         die "host add: unknown option '$1'" ;;
+      *)
+        if [[ -n "${name}" ]]; then
+          die "host add: unexpected argument '$1'"
+        fi
+        name="$1"
+        shift
+        ;;
+    esac
+  done
+  if [[ -z "${name}" ]]; then
+    die "host add: NAME is required"
+  fi
+  validate_field_chars "host name" "${name}" || exit 2
+
+  record="$(printf '%s|%s|%s|%s|%s|%s' \
+    "${name}" "${role}" "${user}" "${address}" "${port}" "${ssh_opts}")"
+  validate_host_record "${record}" unique || exit 2
+  registry_append "${SYNC_HOSTS_FILE}" "${HOSTS_HEADER}" "${record}" \
+    || die "failed to write ${SYNC_HOSTS_FILE}"
+  log_info "registered host '${name}' (role ${role})"
+}
+
+cmd_host_list() {
+  local fmt="table" want_role="" rec bad=0
+
+  while (( $# )); do
+    case "$1" in
+      --format) need_value "$@"; fmt="$2"; shift 2 ;;
+      --role)   need_value "$@"; want_role="$2"; shift 2 ;;
+      -h|--help) usage; return 0 ;;
+      *) die "host list: unknown option '$1'" ;;
+    esac
+  done
+  if [[ -n "${want_role}" ]]; then
+    validate_host_role "${want_role}" || exit 2
+  fi
+
+  registry_load "${SYNC_HOSTS_FILE}" "${HOST_FIELDS}"
+  registry_report_bad || bad=2
+
+  if [[ "${fmt}" == "raw" ]]; then
+    for rec in "${REGISTRY_RECORDS[@]}"; do
+      parse_host_record "${rec}" || continue
+      if [[ -n "${want_role}" && "${HOST_ROLE}" != "${want_role}" ]]; then
+        continue
+      fi
+      printf '%s\n' "${rec}"
+    done
+    return "${bad}"
+  fi
+  if [[ "${fmt}" != "table" ]]; then
+    die "host list: unknown format '${fmt}' (expected table or raw)"
+  fi
+
+  printf '%-14s %-5s %-12s %-24s %-6s %s\n' "NAME" "ROLE" "USER" "ADDRESS" "PORT" "SSH_OPTS"
+  for rec in "${REGISTRY_RECORDS[@]}"; do
+    parse_host_record "${rec}" || continue
+    if [[ -n "${want_role}" && "${HOST_ROLE}" != "${want_role}" ]]; then
+      continue
+    fi
+    printf '%-14s %-5s %-12s %-24s %-6s %s\n' \
+      "${HOST_NAME}" "${HOST_ROLE}" "${HOST_USER:--}" \
+      "${HOST_ADDRESS:--}" "${HOST_PORT:--}" "${HOST_SSH_OPTS:--}"
+  done
+  printf '\n%s\n' "plus the built-in pseudo-host 'local' (role both, plain filesystem paths)"
+  return "${bad}"
+}
+
+cmd_host_show() {
+  local name="${1:-}"
+
+  if [[ -z "${name}" ]]; then
+    die "host show: NAME is required"
+  fi
+  if ! host_lookup "${name}"; then
+    die "host '${name}' is not registered"
+  fi
+  printf 'name      %s\n' "${HOST_NAME}"
+  printf 'role      %s\n' "${HOST_ROLE}"
+  printf 'user      %s\n' "${HOST_USER:--}"
+  printf 'address   %s\n' "${HOST_ADDRESS:--}"
+  printf 'port      %s\n' "${HOST_PORT:--}"
+  printf 'ssh_opts  %s\n' "${HOST_SSH_OPTS:--}"
+  if [[ -z "${HOST_ADDRESS}" ]]; then
+    printf 'resolves  local filesystem paths\n'
+  else
+    printf 'resolves  %s\n' "${HOST_USER:+${HOST_USER}@}${HOST_ADDRESS}:PATH"
+  fi
+}
+
+cmd_host_rm() {
+  local name="" force=0 rec
+  local -a users=()
+
+  while (( $# )); do
+    case "$1" in
+      --force) force=1; shift ;;
+      -h|--help) usage; return 0 ;;
+      -*) die "host rm: unknown option '$1'" ;;
+      *)
+        if [[ -n "${name}" ]]; then
+          die "host rm: unexpected argument '$1'"
+        fi
+        name="$1"
+        shift
+        ;;
+    esac
+  done
+  if [[ -z "${name}" ]]; then
+    die "host rm: NAME is required"
+  fi
+  if [[ "${name}" == "local" ]]; then
+    die "'local' is a built-in pseudo-host and cannot be removed"
+  fi
+
+  registry_load "${SYNC_JOBS_FILE}" "${JOB_FIELDS}"
+  for rec in "${REGISTRY_RECORDS[@]}"; do
+    parse_job_record "${rec}" || continue
+    if [[ "${JOB_SRC%%:*}" == "${name}" || "${JOB_DST%%:*}" == "${name}" ]]; then
+      users+=("${JOB_NAME}")
+    fi
+  done
+  if (( ${#users[@]} > 0 )); then
+    log_error "host '${name}' is used by: ${users[*]}"
+    if (( ! force )); then
+      die "refusing to remove it; pass --force, or remove those jobs first"
+    fi
+    log_warn "removing anyway (--force); those jobs will fail validation"
+  fi
+
+  if ! registry_remove "${SYNC_HOSTS_FILE}" "${name}" "${HOST_FIELDS}"; then
+    die "host '${name}' is not registered"
+  fi
+  log_info "removed host '${name}'"
+}
+
+# ----------------------------------------------------------------------- jobs
+
+# rebuild a record from the parsed JOB_* values, picking up normalised tags
+job_record_from_parsed() {
+  printf '%s|%s|%s|%s|%s' "${JOB_NAME}" "${JOB_SRC}" "${JOB_DST}" "${JOB_OPTS}" "${JOB_TAGS}"
+}
+
+cmd_job_add() {
+  local name="" src="" dst="" opts="" tags="" string="" use_stdin=0
+  local record
+
+  while (( $# )); do
+    case "$1" in
+      --name)   need_value "$@"; name="$2"; shift 2 ;;
+      --src)    need_value "$@"; src="$2"; shift 2 ;;
+      --dst)    need_value "$@"; dst="$2"; shift 2 ;;
+      --opts)   need_value "$@"; opts="$2"; shift 2 ;;
+      --tags)   need_value "$@"; tags="$2"; shift 2 ;;
+      --string) need_value "$@"; string="$2"; shift 2 ;;
+      --stdin)  use_stdin=1; shift ;;
+      -h|--help) usage; return 0 ;;
+      *) die "job add: unknown option '$1'" ;;
+    esac
+  done
+
+  if (( use_stdin )); then
+    if [[ -n "${string}" || -n "${name}" ]]; then
+      die "job add: --stdin cannot be combined with --string or --name"
+    fi
+    job_add_bulk
+    return
+  fi
+
+  if [[ -n "${string}" ]]; then
+    if [[ -n "${name}${src}${dst}${opts}${tags}" ]]; then
+      die "job add: --string cannot be combined with the individual field options"
+    fi
+    if [[ "${string}" == "-" ]]; then
+      IFS= read -r string || die "job add: no record on stdin"
+      string="$(registry_strip "${string}")"
+    fi
+    if [[ "${string}" != *"|"* ]]; then
+      die "job string needs ${JOB_FIELDS} |-separated fields — did you forget to single-quote it?"
+    fi
+    record="${string}"
+  else
+    if [[ -z "${name}" || -z "${src}" || -z "${dst}" ]]; then
+      die "job add: --name, --src and --dst are all required (or use --string)"
+    fi
+    validate_field_chars "job name" "${name}" || exit 2
+    validate_field_chars "src" "${src}" || exit 2
+    validate_field_chars "dst" "${dst}" || exit 2
+    record="$(printf '%s|%s|%s|%s|%s' "${name}" "${src}" "${dst}" "${opts}" "${tags}")"
+  fi
+
+  validate_job_record "${record}" unique || exit 2
+  record="$(job_record_from_parsed)"
+  registry_append "${SYNC_JOBS_FILE}" "${JOBS_HEADER}" "${record}" \
+    || die "failed to write ${SYNC_JOBS_FILE}"
+  log_info "registered job '${JOB_NAME}'${JOB_TAGS:+ (tags ${JOB_TAGS})}"
+  warn_shared_destinations
+}
+
+# bulk import is all-or-nothing: every line is validated before anything is
+# written, so a typo on line 9 cannot leave a half-imported registry.
+job_add_bulk() {
+  local line stripped ok=1
+  local -a records=()
+  local -A batch=()
+
+  while IFS= read -r line || [[ -n "${line}" ]]; do
+    stripped="$(registry_strip "${line}")"
+    if [[ -z "${stripped}" || "${stripped}" == \#* ]]; then
+      continue
+    fi
+    if ! validate_job_record "${stripped}" unique; then
+      ok=0
+      continue
+    fi
+    if [[ -n "${batch[${JOB_NAME}]:-}" ]]; then
+      log_error "duplicate job name '${JOB_NAME}' within the input"
+      ok=0
+      continue
+    fi
+    batch["${JOB_NAME}"]=1
+    records+=("$(job_record_from_parsed)")
+  done
+
+  if (( ! ok )); then
+    die "nothing imported: fix the records above and retry"
+  fi
+  if (( ${#records[@]} == 0 )); then
+    die "no records on stdin"
+  fi
+
+  raw_load "${SYNC_JOBS_FILE}"
+  if (( ${#RAW_LINES[@]} == 0 )); then
+    RAW_LINES=("${JOBS_HEADER}")
+  fi
+  RAW_LINES+=("${records[@]}")
+  printf '%s\n' "${RAW_LINES[@]}" | registry_write "${SYNC_JOBS_FILE}" \
+    || die "failed to write ${SYNC_JOBS_FILE}"
+  log_info "imported ${#records[@]} job(s)"
+  warn_shared_destinations
+}
+
+# does a comma-separated tag list contain any of the wanted tags?
+tags_match() {
+  local have="$1"
+  shift
+  local -a mine=()
+  local tag want
+
+  IFS=',' read -r -a mine <<< "${have}"
+  for want in "$@"; do
+    for tag in "${mine[@]}"; do
+      if [[ "${tag}" == "${want}" ]]; then
+        return 0
+      fi
+    done
+  done
+  return 1
+}
+
+cmd_job_list() {
+  local fmt="table" rec bad=0
+  local -a want_tags=()
+
+  while (( $# )); do
+    case "$1" in
+      --format) need_value "$@"; fmt="$2"; shift 2 ;;
+      --tag)    need_value "$@"; want_tags+=("$2"); shift 2 ;;
+      -h|--help) usage; return 0 ;;
+      *) die "job list: unknown option '$1'" ;;
+    esac
+  done
+
+  registry_load "${SYNC_JOBS_FILE}" "${JOB_FIELDS}"
+  registry_report_bad || bad=2
+
+  if [[ "${fmt}" == "raw" ]]; then
+    for rec in "${REGISTRY_RECORDS[@]}"; do
+      parse_job_record "${rec}" || continue
+      if (( ${#want_tags[@]} > 0 )) && ! tags_match "${JOB_TAGS}" "${want_tags[@]}"; then
+        continue
+      fi
+      printf '%s\n' "${rec}"
+    done
+    return "${bad}"
+  fi
+  if [[ "${fmt}" != "table" ]]; then
+    die "job list: unknown format '${fmt}' (expected table or raw)"
+  fi
+
+  printf '%-20s %-28s %-28s %-22s %s\n' "NAME" "SOURCE" "DESTINATION" "OPTS" "TAGS"
+  for rec in "${REGISTRY_RECORDS[@]}"; do
+    parse_job_record "${rec}" || continue
+    if (( ${#want_tags[@]} > 0 )) && ! tags_match "${JOB_TAGS}" "${want_tags[@]}"; then
+      continue
+    fi
+    printf '%-20s %-28s %-28s %-22s %s\n' \
+      "${JOB_NAME}" "${JOB_SRC}" "${JOB_DST}" "${JOB_OPTS:--}" "${JOB_TAGS:--}"
+  done
+  return "${bad}"
+}
+
+cmd_job_show() {
+  local name="${1:-}" record
+
+  if [[ -z "${name}" ]]; then
+    die "job show: NAME is required"
+  fi
+  record="$(job_lookup "${name}")" || die "job '${name}' is not registered"
+  parse_job_record "${record}"
+  printf 'name    %s\n' "${JOB_NAME}"
+  printf 'source  %s\n' "${JOB_SRC}"
+  printf 'dest    %s\n' "${JOB_DST}"
+  printf 'opts    %s\n' "${JOB_OPTS:--}"
+  printf 'tags    %s\n' "${JOB_TAGS:--}"
+  printf 'record  %s\n' "${record}"
+  if build_rsync_cmd "${record}"; then
+    printf 'command '
+    printf '%q ' "${SYNC_RSYNC_CMD[@]}"
+    printf '\n'
+  fi
+}
+
+cmd_job_rm() {
+  local name="${1:-}"
+
+  if [[ -z "${name}" ]]; then
+    die "job rm: NAME is required"
+  fi
+  if ! registry_remove "${SYNC_JOBS_FILE}" "${name}" "${JOB_FIELDS}"; then
+    die "job '${name}' is not registered"
+  fi
+  log_info "removed job '${name}'"
+}
+
+# ------------------------------------------------------------------ selection
+
+# select job records by name and/or tag, in registry order, deduped.
+# sets SELECTED_RECORDS and SELECTED_NAMES.
+select_jobs() {
+  local want_all="$1"
+  shift
+  local -a want_names=()
+  local -a want_tags=()
+  local mode="names" arg rec
+
+  for arg in "$@"; do
+    if [[ "${arg}" == "--tags-follow" ]]; then
+      mode="tags"
+      continue
+    fi
+    if [[ "${mode}" == "tags" ]]; then
+      want_tags+=("${arg}")
+    else
+      want_names+=("${arg}")
+    fi
+  done
+
+  SELECTED_RECORDS=()
+  SELECTED_NAMES=()
+  local -A picked=()
+  local -A found_name=()
+
+  registry_load "${SYNC_JOBS_FILE}" "${JOB_FIELDS}"
+  for rec in "${REGISTRY_RECORDS[@]}"; do
+    parse_job_record "${rec}" || continue
+    local take=0
+    if (( want_all )); then
+      take=1
+    else
+      for arg in "${want_names[@]}"; do
+        if [[ "${JOB_NAME}" == "${arg}" ]]; then
+          take=1
+          found_name["${arg}"]=1
+        fi
+      done
+      if (( ! take )) && (( ${#want_tags[@]} > 0 )) \
+        && tags_match "${JOB_TAGS}" "${want_tags[@]}"; then
+        take=1
+      fi
+    fi
+    if (( take )) && [[ -z "${picked[${JOB_NAME}]:-}" ]]; then
+      picked["${JOB_NAME}"]=1
+      SELECTED_RECORDS+=("${rec}")
+      SELECTED_NAMES+=("${JOB_NAME}")
+    fi
+  done
+
+  local missing=0
+  for arg in "${want_names[@]}"; do
+    if [[ -z "${found_name[${arg}]:-}" ]]; then
+      log_error "job '${arg}' is not registered"
+      missing=1
+    fi
+  done
+  return "${missing}"
+}
+
+# ------------------------------------------------------------------ rsync cmd
+
+build_rsync_cmd() {
+  local record="$1"
+  local src_host src_path dst_host dst_path src_arg dst_arg
+  local -a ssh_parts=()
+
+  parse_job_record "${record}" || return 1
+  split_host_path "${JOB_SRC}" || return 1
+  src_host="${SPEC_HOST}"
+  src_path="${SPEC_PATH}"
+  split_host_path "${JOB_DST}" || return 1
+  dst_host="${SPEC_HOST}"
+  dst_path="${SPEC_PATH}"
+
+  resolve_endpoint "${src_host}" "${src_path}" \
+    || { log_error "job '${JOB_NAME}': source host '${src_host}' is not registered"; return 1; }
+  src_arg="${RSYNC_PATH_ARG}"
+  if (( ${#RSYNC_SSH_PARTS[@]} > 0 )); then
+    ssh_parts=("${RSYNC_SSH_PARTS[@]}")
+  fi
+
+  resolve_endpoint "${dst_host}" "${dst_path}" \
+    || { log_error "job '${JOB_NAME}': destination host '${dst_host}' is not registered"; return 1; }
+  dst_arg="${RSYNC_PATH_ARG}"
+  if (( ${#RSYNC_SSH_PARTS[@]} > 0 )); then
+    if (( ${#ssh_parts[@]} > 0 )); then
+      log_error "job '${JOB_NAME}': both endpoints are remote; rsync cannot do that"
+      return 1
+    fi
+    ssh_parts=("${RSYNC_SSH_PARTS[@]}")
+  fi
+
+  split_opts "${JOB_OPTS}"
+
+  SYNC_RSYNC_CMD=("${SYNC_RSYNC}")
+  if (( ${#ssh_parts[@]} > 0 )); then
+    # rsync splits this string on whitespace itself, with no quote handling
+    SYNC_RSYNC_CMD+=(-e "${ssh_parts[*]}")
+  fi
+  if (( DRY_RUN )); then
+    SYNC_RSYNC_CMD+=(-n)
+  fi
+  SYNC_RSYNC_CMD+=("${SYNC_OPTS[@]}" -- "${src_arg}" "${dst_arg}")
+  return 0
+}
+
+# ------------------------------------------------------------------- validate
+
+cmd_validate() {
+  local rec bad=0 rc=0
+  local want_all=0
+  local -a names=()
+  local -a tags=()
+
+  while (( $# )); do
+    case "$1" in
+      --tag) need_value "$@"; tags+=("$2"); shift 2 ;;
+      -h|--help) usage; return 0 ;;
+      all) want_all=1; shift ;;
+      -*) die "validate: unknown option '$1'" ;;
+      *) names+=("$1"); shift ;;
+    esac
+  done
+  if (( ${#names[@]} == 0 && ${#tags[@]} == 0 )); then
+    want_all=1
+  fi
+
+  registry_load "${SYNC_HOSTS_FILE}" "${HOST_FIELDS}"
+  registry_report_bad || bad=2
+  local host_count="${#REGISTRY_RECORDS[@]}"
+  local -a host_records=("${REGISTRY_RECORDS[@]}")
+  for rec in "${host_records[@]}"; do
+    validate_host_record "${rec}" || bad=1
+  done
+
+  select_jobs "${want_all}" "${names[@]}" --tags-follow "${tags[@]}" || bad=1
+  for rec in "${SELECTED_RECORDS[@]}"; do
+    if validate_job_record "${rec}"; then
+      build_rsync_cmd "${rec}" || bad=1
+    else
+      bad=1
+    fi
+  done
+  warn_shared_destinations
+
+  if (( bad )); then
+    log_error "validation failed"
+    return 2
+  fi
+  log_info "ok: ${#SELECTED_NAMES[@]} job(s) and ${host_count} host record(s) checked"
+  return "${rc}"
+}
+
+# ------------------------------------------------------------------------ run
+
+rc_is_ok() {
+  local rc="$1" ok
+
+  for ok in "${SYNC_OK_EXIT_CODES[@]}"; do
+    if [[ "${rc}" == "${ok}" ]]; then
+      return 0
+    fi
+  done
+  return 1
+}
+
+# true when a job's opts delete or move data rather than just copying it
+job_is_destructive() {
+  local opts="$1" tok
+
+  split_opts "${opts}"
+  for tok in "${SYNC_OPTS[@]}"; do
+    case "${tok}" in
+      --del|--delete|--delete-*|--remove-source-files) return 0 ;;
+    esac
+  done
+  return 1
+}
+
+fmt_duration() {
+  local s="$1"
+
+  if (( s < 60 )); then
+    printf '%ds' "${s}"
+  else
+    printf '%dm%02ds' "$(( s / 60 ))" "$(( s % 60 ))"
+  fi
+}
+
+run_one_job() {
+  local record="$1"
+  local name log status start end rc=0 rsync_pid
+
+  parse_job_record "${record}" || return 2
+  name="${JOB_NAME}"
+  log="${RUN_DIR}/${name}.log"
+  status="${RUN_DIR}/status/${name}"
+
+  # never let the same job run twice at once, even across two invocations
+  exec 9>"${LOCK_DIR}/${name}.lock"
+  if ! flock -n 9; then
+    printf 'locked - -\n' > "${status}"
+    log_warn "job '${name}' is already running elsewhere, skipping"
+    return 0
+  fi
+
+  if ! build_rsync_cmd "${record}"; then
+    printf 'invalid - -\n' > "${status}"
+    return 2
+  fi
+
+  start="$(date +%s)"
+  {
+    printf '# job=%s start=%s\n' "${name}" "$(date -Is)"
+    printf '# cmd='
+    printf '%q ' "${SYNC_RSYNC_CMD[@]}"
+    printf '\n'
+  } > "${log}"
+
+  # rsync runs in the background and the worker forwards signals to it, so an
+  # interrupt can never orphan a running transfer. `set -m` gives the transfer
+  # its own process group, so the signal reaches anything it spawned (ssh, or a
+  # wrapper script) instead of orphaning those children.
+  set -m
+  if (( VERBOSE )); then
+    "${SYNC_RSYNC_CMD[@]}" > >(tee -a "${log}" >&2) 2>&1 &
+  else
+    "${SYNC_RSYNC_CMD[@]}" >> "${log}" 2>&1 &
+  fi
+  rsync_pid=$!
+  set +m
+  trap 'kill -TERM -'"${rsync_pid}"' 2>/dev/null || kill -TERM '"${rsync_pid}"' 2>/dev/null' TERM INT
+  wait "${rsync_pid}"
+  rc=$?
+  end="$(date +%s)"
+
+  printf '%s %s %s\n' "${rc}" "${start}" "${end}" > "${status}"
+  printf '# job=%s end=%s rc=%s\n' "${name}" "$(date -Is)" "${rc}" >> "${log}"
+
+  if rc_is_ok "${rc}"; then
+    return 0
+  fi
+  if (( FAIL_FAST )) && [[ -n "${POOL_ABORT_FILE}" ]]; then
+    : > "${POOL_ABORT_FILE}"
+  fi
+  return 1
+}
+
+print_summary() {
+  local name status rc start end result dur
+  local total=0 okc=0 failc=0 lockc=0 skipc=0
+
+  printf '\n%-22s %-10s %5s %10s  %s\n' "job" "result" "rc" "duration" "log"
+  for name in "${SELECTED_NAMES[@]}"; do
+    (( total++ ))
+    status="${RUN_DIR}/status/${name}"
+    if [[ ! -f "${status}" ]]; then
+      (( skipc++ ))
+      printf '%-22s %-10s %5s %10s  %s\n' "${name}" "skipped" "-" "-" "-"
+      continue
+    fi
+    read -r rc start end < "${status}"
+    case "${rc}" in
+      locked)
+        (( lockc++ ))
+        printf '%-22s %-10s %5s %10s  %s\n' "${name}" "locked" "-" "-" "-"
+        continue
+        ;;
+      invalid)
+        (( failc++ ))
+        printf '%-22s %-10s %5s %10s  %s\n' "${name}" "INVALID" "-" "-" "-"
+        continue
+        ;;
+    esac
+    dur="$(fmt_duration "$(( end - start ))")"
+    if rc_is_ok "${rc}"; then
+      (( okc++ ))
+      if [[ "${rc}" == "0" ]]; then
+        result="ok"
+      else
+        result="ok(${rc})"
+      fi
+    else
+      (( failc++ ))
+      result="FAILED"
+    fi
+    printf '%-22s %-10s %5s %10s  %s\n' \
+      "${name}" "${result}" "${rc}" "${dur}" "${RUN_DIR}/${name}.log"
+  done
+  printf '%d job(s): %d ok, %d failed, %d locked, %d skipped\n' \
+    "${total}" "${okc}" "${failc}" "${lockc}" "${skipc}"
+  printf 'logs: %s\n' "${RUN_DIR}"
+
+  if (( failc > 0 )); then
+    return 1
+  fi
+  return 0
+}
+
+on_interrupt() {
+  trap '' INT TERM
+  POOL_ABORT="interrupt"
+  log_warn "interrupted; stopping $(pool_alive POOL_PIDS) running job(s)"
+  pool_terminate "${SYNC_KILL_GRACE}"
+  print_summary
+  exit 130
+}
+
+cmd_run() {
+  local want_all=0 assume_yes=0 force=0 workers="${SYNC_WORKERS}"
+  local log_root="${SYNC_LOG_DIR}"
+  local -a names=()
+  local -a tags=()
+  local rec name bad=0
+  local -a destructive=()
+
+  while (( $# )); do
+    case "$1" in
+      all)            want_all=1; shift ;;
+      -t|--tag)       need_value "$@"; tags+=("$2"); shift 2 ;;
+      -j|--jobs)      need_value "$@"; workers="$2"; shift 2 ;;
+      -n|--dry-run)   DRY_RUN=1; shift ;;
+      --yes)          assume_yes=1; shift ;;
+      --fail-fast)    FAIL_FAST=1; shift ;;
+      --log-dir)      need_value "$@"; log_root="$2"; shift 2 ;;
+      --force)        force=1; shift ;;
+      -v|--verbose)   VERBOSE=1; shift ;;
+      -h|--help)      usage; return 0 ;;
+      --)             shift; break ;;
+      -*)             die "run: unknown option '$1'" ;;
+      *)              names+=("$1"); shift ;;
+    esac
+  done
+  names+=("$@")
+
+  if ! [[ "${workers}" =~ ^[0-9]+$ ]] || (( workers < 1 )); then
+    die "run: --jobs needs a positive integer, got '${workers}'"
+  fi
+  if (( want_all )) && (( ${#names[@]} > 0 || ${#tags[@]} > 0 )); then
+    die "run: 'all' cannot be combined with job names or --tag"
+  fi
+  if (( ! want_all )) && (( ${#names[@]} == 0 && ${#tags[@]} == 0 )); then
+    die "run: name a job, pass --tag TAG, or say 'run all'"
+  fi
+  if (( VERBOSE )) && (( workers != 1 )); then
+    log_info "--verbose implies serial execution, using 1 worker"
+    workers=1
+  fi
+
+  registry_load "${SYNC_JOBS_FILE}" "${JOB_FIELDS}"
+  if ! registry_report_bad; then
+    if (( ! force )); then
+      die "refusing to run with unparseable lines in ${SYNC_JOBS_FILE}; fix them or pass --force"
+    fi
+    log_warn "continuing despite unparseable registry lines (--force)"
+  fi
+
+  select_jobs "${want_all}" "${names[@]}" --tags-follow "${tags[@]}" || exit 2
+  if (( ${#SELECTED_RECORDS[@]} == 0 )); then
+    die "no jobs matched"
+  fi
+
+  for rec in "${SELECTED_RECORDS[@]}"; do
+    validate_job_record "${rec}" || bad=1
+  done
+  if (( bad )); then
+    die "refusing to run: fix the jobs above"
+  fi
+
+  if (( ! DRY_RUN )); then
+    for rec in "${SELECTED_RECORDS[@]}"; do
+      parse_job_record "${rec}"
+      if job_is_destructive "${JOB_OPTS}"; then
+        destructive+=("${JOB_NAME}")
+      fi
+    done
+    if (( ${#destructive[@]} > 0 )) && (( ! assume_yes )); then
+      log_error "these jobs delete or move data at the destination: ${destructive[*]}"
+      die "pass --yes to confirm, or --dry-run to preview"
+    fi
+  fi
+
+  RUN_DIR="${log_root}/$(date +%Y%m%dT%H%M%S)-$$"
+  LOCK_DIR="${log_root}/locks"
+  mkdir -p -- "${RUN_DIR}/status" "${LOCK_DIR}" || die "cannot create ${RUN_DIR}"
+  ln -sfn -- "${RUN_DIR}" "${log_root}/latest"
+  LOG_FILE="${RUN_DIR}/run.log"
+  POOL_ABORT_FILE="${RUN_DIR}/abort"
+
+  if (( workers > ${#SELECTED_RECORDS[@]} )); then
+    workers="${#SELECTED_RECORDS[@]}"
+  fi
+  local note=""
+  if (( DRY_RUN )); then
+    note=" (dry run)"
+  fi
+  log_info "running ${#SELECTED_NAMES[@]} job(s) with ${workers} worker(s)${note}"
+  log_info "selection: ${SELECTED_NAMES[*]}"
+  trap on_interrupt INT TERM
+
+  run_pool "${workers}" run_one_job "${SELECTED_RECORDS[@]}"
+  trap - INT TERM
+
+  if print_summary; then
+    return 0
+  fi
+  return 1
+}
+
+# -------------------------------------------------------------------- dispatch
+
+main() {
+  local cmd="${1:-help}"
+  shift || true
+
+  case "${cmd}" in
+    host)
+      local sub="${1:-}"
+      shift || true
+      case "${sub}" in
+        add)  cmd_host_add "$@" ;;
+        list) cmd_host_list "$@" ;;
+        show) cmd_host_show "$@" ;;
+        rm|remove) cmd_host_rm "$@" ;;
+        ""|-h|--help) usage; return 2 ;;
+        *) die "host: unknown subcommand '${sub}'" ;;
+      esac
+      ;;
+    job)
+      local sub="${1:-}"
+      shift || true
+      case "${sub}" in
+        add)  cmd_job_add "$@" ;;
+        list) cmd_job_list "$@" ;;
+        show) cmd_job_show "$@" ;;
+        rm|remove) cmd_job_rm "$@" ;;
+        ""|-h|--help) usage; return 2 ;;
+        *) die "job: unknown subcommand '${sub}'" ;;
+      esac
+      ;;
+    validate) cmd_validate "$@" ;;
+    run)      cmd_run "$@" ;;
+    help|-h|--help) usage; return 0 ;;
+    *) log_error "unknown command '${cmd}'"; usage; return 2 ;;
+  esac
+}
+
+main "$@"

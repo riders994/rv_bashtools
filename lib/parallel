@@ -1,0 +1,108 @@
+# A bounded worker pool for bash. Source this file to load it.
+#
+# run_pool <workers> <fn> <item>...
+#
+# Runs fn once per item, at most <workers> at a time. Children are expected to
+# record their own result somewhere durable: the pool deliberately does not
+# report per-item exit status, because tracking which PID finished would tie it
+# to `wait -n -p`. Every launched PID is appended to POOL_PIDS so a signal
+# handler can tear the whole run down.
+#
+# Set POOL_ABORT to any non-empty value, or create the file named by
+# POOL_ABORT_FILE, to stop launching further items.
+
+POOL_PIDS=()
+POOL_ABORT=""
+POOL_ABORT_FILE=""
+
+# how many of the PIDs in the named array are still running
+pool_alive() {
+  local -n _pids="$1"
+  local pid n=0
+
+  for pid in "${_pids[@]}"; do
+    if kill -0 "${pid}" 2>/dev/null; then
+      (( n++ ))
+    fi
+  done
+  printf '%s' "${n}"
+}
+
+# drop PIDs that have been reaped from the named array
+pool_prune() {
+  local -n _pids="$1"
+  local pid
+  local -a keep=()
+
+  for pid in "${_pids[@]}"; do
+    if kill -0 "${pid}" 2>/dev/null; then
+      keep+=("${pid}")
+    fi
+  done
+  _pids=("${keep[@]}")
+}
+
+# should the pool stop launching new items?
+pool_should_abort() {
+  if [[ -n "${POOL_ABORT}" ]]; then
+    return 0
+  fi
+  if [[ -n "${POOL_ABORT_FILE}" && -e "${POOL_ABORT_FILE}" ]]; then
+    POOL_ABORT="fail-fast"
+    return 0
+  fi
+  return 1
+}
+
+run_pool() {
+  local workers="$1" fn="$2"
+  shift 2
+  local -a items=("$@")
+  local -a running=()
+  local item
+
+  if (( workers < 1 )); then
+    workers=1
+  fi
+  for item in "${items[@]}"; do
+    if pool_should_abort; then
+      break
+    fi
+    # the accounting below can drift by one under a race, briefly allowing an
+    # extra worker. harmless: the authoritative result is whatever the child
+    # recorded, never this bookkeeping.
+    while (( $(pool_alive running) >= workers )); do
+      wait -n 2>/dev/null || true
+      pool_prune running
+    done
+    # re-check: waiting for a free slot is exactly when a child reports a
+    # failure, so the decision taken at the top of the loop is already stale
+    if pool_should_abort; then
+      break
+    fi
+    "${fn}" "${item}" &
+    running+=("$!")
+    POOL_PIDS+=("$!")
+  done
+  wait
+  return 0
+}
+
+# SIGTERM every launched child, then SIGKILL anything still up after a grace
+# period. Called from the parent's INT/TERM handler.
+pool_terminate() {
+  local grace="${1:-5}"
+  local waited=0
+
+  if (( ${#POOL_PIDS[@]} == 0 )); then
+    return 0
+  fi
+  kill -TERM "${POOL_PIDS[@]}" 2>/dev/null
+  while (( $(pool_alive POOL_PIDS) > 0 && waited < grace )); do
+    sleep 1
+    (( waited++ ))
+  done
+  kill -KILL "${POOL_PIDS[@]}" 2>/dev/null
+  wait 2>/dev/null
+  return 0
+}

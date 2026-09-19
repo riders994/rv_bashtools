@@ -1,0 +1,3 @@
+# real config and the live registry. copy the .example files to get started.
+sync/rsync-jobs.conf
+sync/registry/

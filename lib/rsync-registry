@@ -1,0 +1,542 @@
+# Host and job registry handling for sync/rsync-jobs. Source this file to load it.
+#
+# Both registries are pipe-delimited, one record per line, hand-editable:
+#
+#   hosts  name|role|user|address|port|ssh_opts
+#   jobs   name|src_host:path|dst_host:path|opts|tags
+#
+# Callers set SYNC_HOSTS_FILE and SYNC_JOBS_FILE before calling anything here.
+
+HOSTS_HEADER='# name|role|user|address|port|ssh_opts'
+JOBS_HEADER='# name|src_host:path|dst_host:path|opts|tags'
+HOST_FIELDS=6
+JOB_FIELDS=5
+
+NAME_RE='^[A-Za-z0-9][A-Za-z0-9._-]*$'
+TAG_RE='^[A-Za-z0-9][A-Za-z0-9._-]*$'
+
+# ---------------------------------------------------------------- primitives
+
+# count of |-separated fields in a record. counting separators avoids the
+# trailing-empty-field problem: `IFS='|' read -a a <<< "x|y|"` yields 2 elements.
+field_count() {
+  local seps="${1//[^|]/}"
+
+  printf '%s' "$(( ${#seps} + 1 ))"
+}
+
+# strip a trailing CR (hand-edited files may be CRLF) and trailing whitespace
+registry_strip() {
+  local line="${1%$'\r'}"
+
+  printf '%s' "${line%"${line##*[![:space:]]}"}"
+}
+
+# split host:path on the FIRST colon. the name charset forbids ':', so any
+# further colons belong to the path and are preserved.
+split_host_path() {
+  local spec="$1"
+
+  SPEC_HOST=""
+  SPEC_PATH=""
+  if [[ "${spec}" != *:* ]]; then
+    log_error "expected host:path, got '${spec}' (use 'local:${spec}' for a local path)"
+    return 1
+  fi
+  SPEC_HOST="${spec%%:*}"
+  SPEC_PATH="${spec#*:}"
+  return 0
+}
+
+# split an rsync opts field into the SYNC_OPTS argv array. `read -r -a` splits
+# on whitespace and performs no glob expansion, so --exclude=*.tmp stays
+# literal. nothing here is ever eval'd, which is why an opt value cannot
+# contain a space; use --exclude-from=FILE for those.
+split_opts() {
+  local raw="$1"
+
+  SYNC_OPTS=()
+  if [[ -z "${raw}" ]]; then
+    return 0
+  fi
+  read -r -a SYNC_OPTS <<< "${raw}"
+  return 0
+}
+
+# ------------------------------------------------------------------- reading
+
+# load every line of a registry file verbatim into RAW_LINES, comments and
+# blanks included, so rewriting a registry preserves the user's own comments.
+raw_load() {
+  local file="$1"
+  local line
+
+  RAW_LINES=()
+  if [[ ! -r "${file}" ]]; then
+    return 0
+  fi
+  while IFS= read -r line || [[ -n "${line}" ]]; do
+    RAW_LINES+=("${line%$'\r'}")
+  done < "${file}"
+  return 0
+}
+
+# load the parseable records of a registry file into REGISTRY_RECORDS, with
+# matching line numbers in REGISTRY_LINENOS. lines with the wrong field count
+# are never silently skipped: each one is described in REGISTRY_BAD.
+registry_load() {
+  local file="$1" want="$2"
+  local line stripped count lineno=0 base
+
+  REGISTRY_RECORDS=()
+  REGISTRY_LINENOS=()
+  REGISTRY_BAD=()
+  if [[ ! -r "${file}" ]]; then
+    return 0
+  fi
+  base="$(basename -- "${file}")"
+  while IFS= read -r line || [[ -n "${line}" ]]; do
+    (( lineno++ ))
+    stripped="$(registry_strip "${line}")"
+    if [[ -z "${stripped}" || "${stripped}" == \#* ]]; then
+      continue
+    fi
+    count="$(field_count "${stripped}")"
+    if [[ "${count}" != "${want}" ]]; then
+      REGISTRY_BAD+=("${base}:${lineno}: malformed record (want ${want} |-fields, got ${count})")
+      continue
+    fi
+    REGISTRY_RECORDS+=("${stripped}")
+    REGISTRY_LINENOS+=("${lineno}")
+  done < "${file}"
+  return 0
+}
+
+# report every malformed line found by the last registry_load. returns 1 if
+# there were any, so callers can decide whether to continue or refuse.
+registry_report_bad() {
+  local msg
+
+  if (( ${#REGISTRY_BAD[@]} == 0 )); then
+    return 0
+  fi
+  for msg in "${REGISTRY_BAD[@]}"; do
+    log_error "${msg}"
+  done
+  return 1
+}
+
+parse_host_record() {
+  local line="$1"
+
+  if [[ "$(field_count "${line}")" != "${HOST_FIELDS}" ]]; then
+    log_error "malformed host record (want ${HOST_FIELDS} |-fields): ${line}"
+    return 1
+  fi
+  IFS='|' read -r HOST_NAME HOST_ROLE HOST_USER HOST_ADDRESS HOST_PORT HOST_SSH_OPTS <<< "${line}"
+  if [[ -z "${HOST_ROLE}" ]]; then
+    HOST_ROLE="${DEFAULT_SYNC_HOST_ROLE}"
+  fi
+  return 0
+}
+
+parse_job_record() {
+  local line="$1"
+
+  if [[ "$(field_count "${line}")" != "${JOB_FIELDS}" ]]; then
+    log_error "malformed job record (want ${JOB_FIELDS} |-fields): ${line}"
+    return 1
+  fi
+  IFS='|' read -r JOB_NAME JOB_SRC JOB_DST JOB_OPTS JOB_TAGS <<< "${line}"
+  return 0
+}
+
+# 'local' is a reserved built-in pseudo-host: always registered, always both,
+# always resolving to a plain filesystem path.
+host_lookup() {
+  local name="$1"
+  local rec
+
+  HOST_NAME=""
+  HOST_ROLE=""
+  HOST_USER=""
+  HOST_ADDRESS=""
+  HOST_PORT=""
+  HOST_SSH_OPTS=""
+  if [[ "${name}" == "local" ]]; then
+    HOST_NAME="local"
+    HOST_ROLE="both"
+    return 0
+  fi
+  registry_load "${SYNC_HOSTS_FILE}" "${HOST_FIELDS}"
+  for rec in "${REGISTRY_RECORDS[@]}"; do
+    if parse_host_record "${rec}" && [[ "${HOST_NAME}" == "${name}" ]]; then
+      if [[ -z "${HOST_PORT}" ]]; then
+        HOST_PORT="${DEFAULT_SYNC_SSH_PORT}"
+      fi
+      return 0
+    fi
+  done
+  HOST_NAME=""
+  return 1
+}
+
+# echoes the job record for a name, or returns 1
+job_lookup() {
+  local name="$1"
+  local rec
+
+  registry_load "${SYNC_JOBS_FILE}" "${JOB_FIELDS}"
+  for rec in "${REGISTRY_RECORDS[@]}"; do
+    if parse_job_record "${rec}" && [[ "${JOB_NAME}" == "${name}" ]]; then
+      printf '%s' "${rec}"
+      return 0
+    fi
+  done
+  return 1
+}
+
+# true when a host name resolves to plain local paths rather than an ssh target
+host_is_local() {
+  local name="$1"
+
+  if [[ "${name}" == "local" ]]; then
+    return 0
+  fi
+  host_lookup "${name}" || return 1
+  [[ -z "${HOST_ADDRESS}" ]]
+}
+
+# ---------------------------------------------------------------- validation
+
+# reject characters that would corrupt a record or silently disappoint the user
+validate_field_chars() {
+  local label="$1" value="$2"
+
+  if [[ "${value}" == *"|"* ]]; then
+    log_error "${label} may not contain '|' — it is the field separator: ${value}"
+    return 1
+  fi
+  if [[ "${value}" == *$'\n'* || "${value}" == *$'\r'* ]]; then
+    log_error "${label} may not contain a newline"
+    return 1
+  fi
+  return 0
+}
+
+validate_opts_field() {
+  local opts="$1"
+
+  validate_field_chars "opts" "${opts}" || return 1
+  # nothing here is eval'd, so shell syntax would be taken literally. a hard
+  # error is kinder than silently passing '$(cat x)' to rsync as a filename.
+  if [[ "${opts}" == *'$'* || "${opts}" == *'`'* || "${opts}" == *';'* || "${opts}" == *'&'* ]]; then
+    log_error "opts may not contain \$ \` ; or & — they are not expanded: ${opts}"
+    return 1
+  fi
+  if [[ "${opts}" == *'"'* || "${opts}" == *"'"* ]]; then
+    log_warn "opts contains a quote character, which is passed to rsync literally;"
+    log_warn "  for a value with spaces use --exclude-from=FILE instead: ${opts}"
+  fi
+  return 0
+}
+
+# normalise a comma-separated tag list into JOB_TAGS: empties dropped, deduped,
+# original order kept.
+validate_tags_field() {
+  local raw="$1"
+  local -a out=()
+  local -A seen=()
+  local tag
+
+  validate_field_chars "tags" "${raw}" || return 1
+  IFS=',' read -r -a out <<< "${raw}"
+  JOB_TAGS=""
+  for tag in "${out[@]}"; do
+    if [[ -z "${tag}" ]]; then
+      continue
+    fi
+    if [[ ! "${tag}" =~ ${TAG_RE} ]]; then
+      log_error "invalid tag '${tag}' (allowed: letters, digits, . _ -)"
+      return 1
+    fi
+    if [[ -n "${seen[${tag}]:-}" ]]; then
+      continue
+    fi
+    seen["${tag}"]=1
+    JOB_TAGS="${JOB_TAGS:+${JOB_TAGS},}${tag}"
+  done
+  return 0
+}
+
+validate_host_role() {
+  local role="$1"
+
+  case "${role}" in
+    both|send|recv) return 0 ;;
+    *) log_error "invalid role '${role}' (expected both, send or recv)"; return 1 ;;
+  esac
+}
+
+# validate a full host record. $2 = "unique" to also reject an existing name.
+validate_host_record() {
+  local record="$1" mode="${2:-}"
+  local rec existing
+
+  parse_host_record "${record}" || return 1
+
+  if [[ ! "${HOST_NAME}" =~ ${NAME_RE} ]]; then
+    log_error "invalid host name '${HOST_NAME}' (allowed: letters, digits, . _ -)"
+    return 1
+  fi
+  case "${HOST_NAME}" in
+    local) log_error "'local' is a reserved pseudo-host and cannot be registered"; return 1 ;;
+    all) log_error "'all' is reserved by the run command and cannot be a host name"; return 1 ;;
+  esac
+  validate_host_role "${HOST_ROLE}" || return 1
+  validate_field_chars "user" "${HOST_USER}" || return 1
+  validate_field_chars "address" "${HOST_ADDRESS}" || return 1
+  validate_field_chars "ssh_opts" "${HOST_SSH_OPTS}" || return 1
+  if [[ -n "${HOST_PORT}" && ! "${HOST_PORT}" =~ ^[0-9]+$ ]]; then
+    log_error "invalid port '${HOST_PORT}' for host '${HOST_NAME}'"
+    return 1
+  fi
+  if [[ "${HOST_USER}" == *@* ]]; then
+    log_error "user '${HOST_USER}' should not contain '@'; give the address separately"
+    return 1
+  fi
+  # rsync splits the -e string on whitespace with no quote handling
+  if [[ "${HOST_SSH_OPTS}" == *'  '* ]]; then
+    log_warn "host '${HOST_NAME}': ssh_opts has repeated spaces, which are collapsed"
+  fi
+  if [[ -z "${HOST_ADDRESS}" ]]; then
+    log_warn "host '${HOST_NAME}' has no address, so its paths resolve locally"
+  fi
+
+  if [[ "${mode}" == "unique" ]]; then
+    registry_load "${SYNC_HOSTS_FILE}" "${HOST_FIELDS}"
+    existing="${HOST_NAME}"
+    for rec in "${REGISTRY_RECORDS[@]}"; do
+      if [[ "${rec%%|*}" == "${existing}" ]]; then
+        log_error "host '${existing}' is already registered (remove it first, or edit ${SYNC_HOSTS_FILE})"
+        parse_host_record "${record}"
+        return 1
+      fi
+    done
+    parse_host_record "${record}"
+  fi
+  return 0
+}
+
+# validate a full job record. $2 = "unique" to also reject an existing name.
+# leaves JOB_* set on success, with JOB_TAGS normalised.
+validate_job_record() {
+  local record="$1" mode="${2:-}"
+  local src_host src_path dst_host dst_path rec name
+  local src_local dst_local
+
+  parse_job_record "${record}" || return 1
+  name="${JOB_NAME}"
+
+  if [[ ! "${JOB_NAME}" =~ ${NAME_RE} ]]; then
+    log_error "invalid job name '${JOB_NAME}' (allowed: letters, digits, . _ -)"
+    return 1
+  fi
+  if [[ "${JOB_NAME}" == "all" ]]; then
+    log_error "'all' is reserved by the run command and cannot be a job name"
+    return 1
+  fi
+
+  split_host_path "${JOB_SRC}" || return 1
+  src_host="${SPEC_HOST}"
+  src_path="${SPEC_PATH}"
+  split_host_path "${JOB_DST}" || return 1
+  dst_host="${SPEC_HOST}"
+  dst_path="${SPEC_PATH}"
+
+  if [[ -z "${src_path}" ]]; then
+    log_error "job '${name}': source path is empty"
+    return 1
+  fi
+  if [[ -z "${dst_path}" ]]; then
+    log_error "job '${name}': destination path is empty"
+    return 1
+  fi
+
+  if ! host_lookup "${src_host}"; then
+    log_error "job '${name}': source host '${src_host}' is not registered"
+    return 1
+  fi
+  if [[ "${HOST_ROLE}" == "recv" ]]; then
+    log_error "job '${name}': host '${src_host}' is receive-only and cannot be a job source"
+    return 1
+  fi
+  src_local=0
+  [[ -z "${HOST_ADDRESS}" ]] && src_local=1
+  if (( ! src_local )) && [[ "${src_path}" != /* && "${src_path}" != '~'* ]]; then
+    log_warn "job '${name}': remote source path '${src_path}' is relative to \$HOME on ${src_host}"
+  fi
+
+  if ! host_lookup "${dst_host}"; then
+    log_error "job '${name}': destination host '${dst_host}' is not registered"
+    return 1
+  fi
+  if [[ "${HOST_ROLE}" == "send" ]]; then
+    log_error "job '${name}': host '${dst_host}' is send-only and cannot be a job destination"
+    return 1
+  fi
+  dst_local=0
+  [[ -z "${HOST_ADDRESS}" ]] && dst_local=1
+  if (( ! dst_local )) && [[ "${dst_path}" != /* && "${dst_path}" != '~'* ]]; then
+    log_warn "job '${name}': remote destination path '${dst_path}' is relative to \$HOME on ${dst_host}"
+  fi
+
+  if (( ! src_local && ! dst_local )); then
+    log_error "job '${name}': rsync cannot transfer between two remote hosts ('${src_host}' and '${dst_host}');"
+    log_error "  stage through a local path, or run the tool on one of them"
+    return 1
+  fi
+
+  validate_opts_field "${JOB_OPTS}" || return 1
+  validate_tags_field "${JOB_TAGS}" || return 1
+
+  if [[ "${mode}" == "unique" ]]; then
+    registry_load "${SYNC_JOBS_FILE}" "${JOB_FIELDS}"
+    for rec in "${REGISTRY_RECORDS[@]}"; do
+      if [[ "${rec%%|*}" == "${name}" ]]; then
+        log_error "job '${name}' is already registered (remove it first, or edit ${SYNC_JOBS_FILE})"
+        return 1
+      fi
+    done
+  fi
+
+  # re-parse so JOB_* reflect this record, then restore the normalised tags
+  local tags="${JOB_TAGS}"
+  parse_job_record "${record}"
+  JOB_TAGS="${tags}"
+  return 0
+}
+
+# warn when two jobs write into the same destination: --delete under
+# parallelism makes that actively destructive.
+warn_shared_destinations() {
+  local -A dests=()
+  local rec dst owner
+
+  registry_load "${SYNC_JOBS_FILE}" "${JOB_FIELDS}"
+  for rec in "${REGISTRY_RECORDS[@]}"; do
+    parse_job_record "${rec}" || continue
+    dst="${JOB_DST}"
+    owner="${dests[${dst}]:-}"
+    if [[ -n "${owner}" ]]; then
+      log_warn "jobs '${owner}' and '${JOB_NAME}' share destination '${dst}'"
+    else
+      dests["${dst}"]="${JOB_NAME}"
+    fi
+  done
+  return 0
+}
+
+# ------------------------------------------------------------------- writing
+
+# atomically replace a registry file with the lines fed on stdin
+registry_write() {
+  local file="$1"
+  local dir tmp rc=0
+
+  dir="$(dirname -- "${file}")"
+  mkdir -p -- "${dir}" || return 1
+  exec 8>"${file}.lock" || return 1
+  if ! flock 8; then
+    exec 8>&-
+    return 1
+  fi
+  tmp="$(mktemp -- "${file}.XXXXXX")" || { exec 8>&-; return 1; }
+  cat > "${tmp}" || rc=1
+  chmod 0600 -- "${tmp}" || rc=1
+  if (( rc == 0 )) && mv -f -- "${tmp}" "${file}"; then
+    exec 8>&-
+    return 0
+  fi
+  rm -f -- "${tmp}"
+  exec 8>&-
+  return 1
+}
+
+# append one record, creating the file with its header if needed
+registry_append() {
+  local file="$1" header="$2" record="$3"
+  local line
+
+  raw_load "${file}"
+  if (( ${#RAW_LINES[@]} == 0 )); then
+    RAW_LINES=("${header}")
+  fi
+  RAW_LINES+=("${record}")
+  {
+    for line in "${RAW_LINES[@]}"; do
+      printf '%s\n' "${line}"
+    done
+  } | registry_write "${file}"
+}
+
+# drop every record whose first field equals a name, preserving comments
+registry_remove() {
+  local file="$1" want="$2" fields="$3"
+  local line stripped found=0
+  local -a keep=()
+
+  raw_load "${file}"
+  for line in "${RAW_LINES[@]}"; do
+    stripped="$(registry_strip "${line}")"
+    if [[ -n "${stripped}" && "${stripped}" != \#* ]] \
+      && [[ "$(field_count "${stripped}")" == "${fields}" ]] \
+      && [[ "${stripped%%|*}" == "${want}" ]]; then
+      found=1
+      continue
+    fi
+    keep+=("${line}")
+  done
+  if (( ! found )); then
+    return 1
+  fi
+  {
+    for line in "${keep[@]}"; do
+      printf '%s\n' "${line}"
+    done
+  } | registry_write "${file}"
+}
+
+# ------------------------------------------------------------------ endpoints
+
+# turn a host name plus a path into an rsync endpoint.
+# sets RSYNC_PATH_ARG, and RSYNC_SSH_PARTS (empty for a local endpoint).
+resolve_endpoint() {
+  local hname="$1" path="$2"
+  local -a extra=()
+
+  RSYNC_PATH_ARG=""
+  RSYNC_SSH_PARTS=()
+  host_lookup "${hname}" || return 1
+
+  if [[ -z "${HOST_ADDRESS}" ]]; then
+    # rsync reads a colon before the first slash as "this is remote", so a
+    # relative local path containing a colon needs anchoring
+    if [[ "${path}" != /* && "${path}" != ./* && "${path}" != '~'* && "${path}" == *:* ]]; then
+      path="./${path}"
+    fi
+    RSYNC_PATH_ARG="${path}"
+    return 0
+  fi
+
+  RSYNC_PATH_ARG="${HOST_USER:+${HOST_USER}@}${HOST_ADDRESS}:${path}"
+  RSYNC_SSH_PARTS=(ssh)
+  if [[ -n "${HOST_PORT}" ]]; then
+    RSYNC_SSH_PARTS+=(-p "${HOST_PORT}")
+  fi
+  if [[ -n "${HOST_SSH_OPTS}" ]]; then
+    read -r -a extra <<< "${HOST_SSH_OPTS}"
+    RSYNC_SSH_PARTS+=("${extra[@]}")
+  fi
+  return 0
+}

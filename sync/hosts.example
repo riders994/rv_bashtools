@@ -1,0 +1,16 @@
+# Example host registry. Copy to registry/hosts, or use `rsync-jobs host add`.
+#
+# name|role|user|address|port|ssh_opts
+#
+#   role      both (default), send (source only) or recv (destination only)
+#   user      empty lets ~/.ssh/config decide
+#   address   empty means the host resolves to plain local paths
+#   port      empty lets ~/.ssh/config decide
+#   ssh_opts  extra ssh flags, whitespace separated, no spaces inside a value
+#
+# Comments must be on their own line: '#' is legal inside rsync opts and paths,
+# so a trailing comment is never stripped.
+
+nas|both|weezy|nas.lan||
+backup|recv|backupsvc|192.168.1.40|2222|-o BatchMode=yes
+media|send|piders994|thegoldenunasinn|50314|

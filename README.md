@@ -9,4 +9,5 @@ down on a fresh machine and run what you need.
 - `new-machine/` — setting up a fresh personal computer or laptop (packages, dotfiles, shell config)
 - `vm/` — creating and provisioning virtual machines
 - `server/` — setting up and hardening servers
+- `sync/` — running sets of rsync jobs between registered hosts
 - `lib/` — shared bash functions/helpers meant to be sourced by other scripts

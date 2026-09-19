@@ -1,0 +1,301 @@
+#!/usr/bin/env bash
+# Smoke tests for sync/rsync-jobs.
+#
+# Runs entirely against a throwaway registry in a temp directory, driven by the
+# RV_SYNC_* overrides, so the real registry and real hosts are never touched.
+# Transfers are local-to-local, so no network is needed. The one test that
+# exercises the ssh -e path needs an sshd you can reach as yourself and is
+# opt-in: RV_SYNC_TEST_SSH=1 sync/selftest
+set -uo pipefail
+
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+TOOL="${SCRIPT_DIR}/rsync-jobs"
+
+TESTS=0
+FAILS=0
+WORK=""
+
+cleanup() {
+  if [[ -n "${WORK}" && -d "${WORK}" ]]; then
+    rm -rf -- "${WORK}"
+  fi
+}
+trap cleanup EXIT
+
+pass() {
+  (( TESTS++ ))
+  printf 'ok   %s\n' "$*"
+}
+
+fail() {
+  (( TESTS++ ))
+  (( FAILS++ ))
+  printf 'FAIL %s\n' "$*"
+}
+
+# expect a command to succeed
+want_ok() {
+  local desc="$1"
+  shift
+
+  if "$@" > "${WORK}/out" 2>&1; then
+    pass "${desc}"
+  else
+    fail "${desc} (exit $?)"
+    sed 's/^/     /' "${WORK}/out"
+  fi
+}
+
+# expect a command to fail with a specific exit code
+want_rc() {
+  local desc="$1" want="$2"
+  shift 2
+  local rc=0
+
+  "$@" > "${WORK}/out" 2>&1 || rc=$?
+  if [[ "${rc}" == "${want}" ]]; then
+    pass "${desc}"
+  else
+    fail "${desc} (want exit ${want}, got ${rc})"
+    sed 's/^/     /' "${WORK}/out"
+  fi
+}
+
+want_eq() {
+  local desc="$1" got="$2" want="$3"
+
+  if [[ "${got}" == "${want}" ]]; then
+    pass "${desc}"
+  else
+    fail "${desc} (want '${want}', got '${got}')"
+  fi
+}
+
+# ---------------------------------------------------------------------- setup
+
+WORK="$(mktemp -d)" || exit 1
+export RV_SYNC_REGISTRY_DIR="${WORK}/reg"
+export RV_SYNC_LOG_DIR="${WORK}/logs"
+export RV_SYNC_LOG_LEVEL="warn"
+
+# a stub standing in for rsync: records the pid of the process it spawns, so
+# the interrupt test can prove the whole process group was torn down
+export STUB_PIDS="${WORK}/stub-pids"
+cat > "${WORK}/stub" <<'STUB'
+#!/usr/bin/env bash
+sleep "${STUB_SLEEP:-2}" &
+child=$!
+printf '%s\n' "${child}" >> "${STUB_PIDS}"
+wait "${child}" 2>/dev/null
+exit "${STUB_RC:-0}"
+STUB
+chmod +x "${WORK}/stub"
+
+printf '== registry basics ==\n'
+want_ok "host add" "${TOOL}" host add nas --user weezy --address nas.lan
+want_ok "host add send-only" "${TOOL}" host add sender --address 10.0.0.1 --role send
+want_ok "host add recv-only" "${TOOL}" host add receiver --address 10.0.0.2 --role recv
+want_ok "host list" "${TOOL}" host list
+want_ok "host show" "${TOOL}" host show nas
+want_rc "host show of unknown host fails" 2 "${TOOL}" host show nope
+want_rc "'local' cannot be registered" 2 "${TOOL}" host add local --address 1.2.3.4
+want_rc "'local' cannot be removed" 2 "${TOOL}" host rm local
+
+# -------------------------------------------------------------- transfer works
+
+printf '== local transfer ==\n'
+mkdir -p "${WORK}/src/sub" "${WORK}/dst"
+echo hello > "${WORK}/src/sub/a.txt"
+echo world > "${WORK}/src/b.txt"
+want_ok "job add via --string" \
+  "${TOOL}" job add --string "t1|local:${WORK}/src/|local:${WORK}/dst/|-a|smoke"
+want_ok "validate" "${TOOL}" validate
+want_ok "dry run" "${TOOL}" run t1 -n
+want_eq "dry run copied nothing" "$(find "${WORK}/dst" -type f | wc -l)" "0"
+want_ok "real run" "${TOOL}" run t1
+want_ok "source and destination match" diff -r "${WORK}/src" "${WORK}/dst"
+want_ok "per-job log exists" test -s "${RV_SYNC_LOG_DIR}/latest/t1.log"
+want_ok "log records the exact command" grep -q '^# cmd=rsync' "${RV_SYNC_LOG_DIR}/latest/t1.log"
+
+want_ok "job add via field options" \
+  "${TOOL}" job add --name t2 --src "local:${WORK}/src/" --dst "local:${WORK}/dst2/" --opts "-a" --tags smoke
+want_ok "job show" "${TOOL}" job show t2
+want_ok "job list by tag" "${TOOL}" job list --tag smoke
+want_eq "tag filter selects both" "$("${TOOL}" job list --tag smoke --format raw | wc -l)" "2"
+want_ok "job rm" "${TOOL}" job rm t2
+want_rc "job rm of unknown job fails" 2 "${TOOL}" job rm t2
+
+# ------------------------------------------------------------- validation says no
+
+printf '== validation rejections ==\n'
+want_rc "unregistered host" 2 "${TOOL}" job add --string 'x|nosuch:/a/|local:/b/||'
+want_rc "wrong field count" 2 "${TOOL}" job add --string 'x|only|three|fields'
+want_rc "unquoted job string" 2 "${TOOL}" job add --string 'justaname'
+want_rc "duplicate job name" 2 "${TOOL}" job add --string "t1|local:/a/|local:/b/||"
+want_rc "missing colon in spec" 2 "${TOOL}" job add --string 'x|/srv/photos/|local:/b/||'
+want_rc "send-only host as destination" 2 "${TOOL}" job add --string 'x|local:/a/|sender:/b/||'
+want_rc "recv-only host as source" 2 "${TOOL}" job add --string 'x|receiver:/a/|local:/b/||'
+want_rc "both endpoints remote" 2 "${TOOL}" job add --string 'x|nas:/a/|receiver:/b/||'
+want_rc "shell syntax in opts" 2 "${TOOL}" job add --string 'x|local:/a/|local:/b/|--exclude=$(cat y)|'
+want_rc "pipe inside a field" 2 "${TOOL}" job add --name x --src 'local:/a/' --dst 'local:/b/' --opts '--foo|bar'
+want_rc "reserved job name 'all'" 2 "${TOOL}" job add --string 'all|local:/a/|local:/b/||'
+
+printf '== destructive jobs need --yes ==\n'
+want_ok "register a --delete job" \
+  "${TOOL}" job add --string "del1|local:${WORK}/src/|local:${WORK}/dst3/|-a --delete|danger"
+want_rc "run refuses --delete without --yes" 2 "${TOOL}" run del1
+want_ok "--dry-run needs no confirmation" "${TOOL}" run del1 -n
+want_ok "--yes allows it" "${TOOL}" run del1 --yes
+
+printf '== malformed registry lines ==\n'
+echo 'broken|line|here' >> "${RV_SYNC_REGISTRY_DIR}/jobs"
+want_rc "list reports a bad line" 2 "${TOOL}" job list
+want_rc "run refuses to start" 2 "${TOOL}" run all
+want_ok "--force overrides" "${TOOL}" run t1 --force
+sed -i '/^broken|/d' "${RV_SYNC_REGISTRY_DIR}/jobs"
+
+printf '== bulk import is all-or-nothing ==\n'
+before="$("${TOOL}" job list --format raw 2>/dev/null | wc -l)"
+printf '%s\n' \
+  "good1|local:${WORK}/src/|local:${WORK}/g1/|-a|bulk" \
+  "bad1|nosuchhost:/a/|local:/b/||" \
+  | "${TOOL}" job add --stdin > "${WORK}/out" 2>&1
+want_eq "nothing imported when one line is bad" \
+  "$("${TOOL}" job list --format raw 2>/dev/null | wc -l)" "${before}"
+printf '%s\n' \
+  "good1|local:${WORK}/src/|local:${WORK}/g1/|-a|bulk" \
+  "# a comment, skipped" \
+  "good2|local:${WORK}/src/|local:${WORK}/g2/|-a|bulk" \
+  | "${TOOL}" job add --stdin > "${WORK}/out" 2>&1
+want_eq "clean input imports every record" \
+  "$("${TOOL}" job list --tag bulk --format raw 2>/dev/null | wc -l)" "2"
+
+printf '== comments survive a rewrite ==\n'
+printf '# a note of my own\n' >> "${RV_SYNC_REGISTRY_DIR}/hosts"
+"${TOOL}" host add temp --address 10.9.9.9 > /dev/null 2>&1
+"${TOOL}" host rm temp > /dev/null 2>&1
+want_ok "hand-written comment still there" \
+  grep -q '^# a note of my own$' "${RV_SYNC_REGISTRY_DIR}/hosts"
+
+printf '== host rm guards jobs that use it ==\n'
+want_ok "register a job that uses the host" \
+  "${TOOL}" job add --string "uses-nas|nas:/srv/x/|local:${WORK}/nasdst/|-a|hostref"
+want_rc "refuses while a job references it" 2 "${TOOL}" host rm nas
+want_ok "--force removes it anyway" "${TOOL}" host rm nas --force
+want_rc "the orphaned job now fails validation" 2 "${TOOL}" validate uses-nas
+want_ok "clean up the orphaned job" "${TOOL}" job rm uses-nas
+
+# ------------------------------------------------------------------ concurrency
+
+printf '== concurrency ==\n'
+for i in 1 2 3 4 5 6 7 8; do
+  "${TOOL}" job add --string "p${i}|local:${WORK}/src/|local:${WORK}/p${i}/|-a|para" > /dev/null 2>&1
+done
+export RV_SYNC_RSYNC="${WORK}/stub"
+export STUB_SLEEP=1
+
+start="$(date +%s)"
+want_ok "8 jobs serially" "${TOOL}" run --tag para -j 1
+serial=$(( $(date +%s) - start ))
+
+start="$(date +%s)"
+want_ok "8 jobs with 4 workers" "${TOOL}" run --tag para -j 4
+parallel=$(( $(date +%s) - start ))
+
+if (( serial >= 7 )); then
+  pass "serial run took ${serial}s, as expected for 8 x 1s"
+else
+  fail "serial run took only ${serial}s; the stub may not be in use"
+fi
+if (( parallel <= 5 )); then
+  pass "4 workers finished in ${parallel}s (serial was ${serial}s)"
+else
+  fail "4 workers took ${parallel}s, no better than serial (${serial}s)"
+fi
+
+printf '== per-job lock ==\n'
+STUB_SLEEP=4 "${TOOL}" run p1 > "${WORK}/lock1" 2>&1 &
+lock_pid=$!
+sleep 1
+STUB_SLEEP=4 "${TOOL}" run p1 > "${WORK}/lock2" 2>&1
+want_ok "second invocation reports the job as locked" grep -q 'locked' "${WORK}/lock2"
+wait "${lock_pid}"
+want_ok "first invocation still succeeded" grep -qE '^p1 +ok' "${WORK}/lock1"
+
+printf '== fail-fast ==\n'
+STUB_RC=23 STUB_SLEEP=1 "${TOOL}" run --tag para -j 1 --fail-fast > "${WORK}/ff" 2>&1
+want_ok "one failure, the rest skipped" grep -q '1 failed, 0 locked, 7 skipped' "${WORK}/ff"
+STUB_RC=23 STUB_SLEEP=1 "${TOOL}" run --tag para -j 8 > "${WORK}/noff" 2>&1
+want_ok "without --fail-fast everything runs" grep -q '8 ok\|0 ok, 8 failed' "${WORK}/noff"
+
+printf '== interrupt ==\n'
+# Job control matters here: with `set -m` off, bash sets SIGINT to ignored for
+# an asynchronous command, and a signal ignored at shell entry cannot be
+# trapped -- so a background run would never see the INT at all. Turning job
+# control on gives the run its own process group and a deliverable SIGINT,
+# which is what a terminal Ctrl-C actually produces.
+interrupt_case() {
+  local signal="$1"
+  local rc=0 started alive=0 p
+
+  : > "${STUB_PIDS}"
+  set -m
+  STUB_SLEEP=10 "${TOOL}" run --tag para -j 3 > "${WORK}/int-${signal}" 2>&1 &
+  local pid=$!
+  set +m
+  sleep 2
+  started="$(wc -l < "${STUB_PIDS}")"
+  if [[ "${started}" != "3" ]]; then
+    fail "SIG${signal}: expected 3 transfers in flight, saw ${started}"
+    kill -KILL "-${pid}" 2>/dev/null
+    wait "${pid}" 2>/dev/null
+    return
+  fi
+
+  kill "-${signal}" "${pid}" 2>/dev/null
+  wait "${pid}" || rc=$?
+  want_eq "SIG${signal}: exits 130" "${rc}" "130"
+
+  # the table row, not the summary line, which contains the word anyway
+  if grep -qE '^p[0-9]+ +skipped' "${WORK}/int-${signal}"; then
+    pass "SIG${signal}: unlaunched jobs reported as skipped"
+  else
+    fail "SIG${signal}: no job was reported as skipped"
+    sed 's/^/     /' "${WORK}/int-${signal}"
+  fi
+
+  sleep 1
+  while read -r p; do
+    if [[ -n "${p}" ]] && kill -0 "${p}" 2>/dev/null; then
+      (( alive++ ))
+      kill -KILL "${p}" 2>/dev/null
+    fi
+  done < "${STUB_PIDS}"
+  want_eq "SIG${signal}: no transfer orphaned (of ${started} started)" "${alive}" "0"
+}
+
+interrupt_case INT
+interrupt_case TERM
+
+# ------------------------------------------------------------- optional: ssh
+
+if [[ "${RV_SYNC_TEST_SSH:-}" == "1" ]]; then
+  printf '== ssh endpoint (opt-in) ==\n'
+  unset RV_SYNC_RSYNC
+  want_ok "register a loopback host" \
+    "${TOOL}" host add loopback --user "${USER}" --address 127.0.0.1
+  want_ok "register a job pulling from it" \
+    "${TOOL}" job add --string "sshpull|loopback:${WORK}/src/|local:${WORK}/sshdst/|-a|ssh"
+  want_ok "ssh transfer runs" "${TOOL}" run sshpull
+  want_ok "ssh transfer landed" diff -r "${WORK}/src" "${WORK}/sshdst"
+else
+  printf '== ssh endpoint skipped (set RV_SYNC_TEST_SSH=1 to run it) ==\n'
+fi
+
+# ---------------------------------------------------------------------- results
+
+printf '\n%d test(s), %d failure(s)\n' "${TESTS}" "${FAILS}"
+if (( FAILS > 0 )); then
+  exit 1
+fi
+exit 0
