@@ -1,0 +1,40 @@
+# Logging helpers shared across all script categories. Source this file to load them.
+#
+# Honours LOG_LEVEL (falling back to DEFAULT_LOG_LEVEL) and, when LOG_FILE is
+# set, appends a timestamped copy of every emitted line to it. Messages always
+# go to stderr so a script's stdout stays machine readable.
+
+: "${DEFAULT_LOG_LEVEL:=info}"
+
+# numeric rank per level, so the threshold test is a single comparison
+log_level_rank() {
+  case "$1" in
+    debug) printf '10' ;;
+    info)  printf '20' ;;
+    warn)  printf '30' ;;
+    error) printf '40' ;;
+    *)     printf '20' ;;
+  esac
+}
+
+log_at() {
+  local level="$1"
+  shift
+  local threshold
+
+  threshold="$(log_level_rank "${LOG_LEVEL:-${DEFAULT_LOG_LEVEL}}")"
+  if (( $(log_level_rank "${level}") < threshold )); then
+    return 0
+  fi
+
+  printf '%s %-5s %s\n' "$(date +%H:%M:%S)" "${level}" "$*" >&2
+  if [[ -n "${LOG_FILE:-}" ]]; then
+    printf '%s %-5s %s\n' "$(date -Is)" "${level}" "$*" >> "${LOG_FILE}"
+  fi
+  return 0
+}
+
+log_debug() { log_at debug "$@"; }
+log_info()  { log_at info  "$@"; }
+log_warn()  { log_at warn  "$@"; }
+log_error() { log_at error "$@"; }

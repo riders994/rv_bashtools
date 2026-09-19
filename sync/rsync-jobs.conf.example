@@ -1,0 +1,39 @@
+# Per-machine settings for rsync-jobs. Copy to rsync-jobs.conf and edit.
+#
+#   cp sync/rsync-jobs.conf.example sync/rsync-jobs.conf
+#
+# rsync-jobs.conf is gitignored, so local paths stay out of the repo. Every
+# setting here can also be overridden for a single invocation with the matching
+# RV_SYNC_* environment variable, which takes precedence over this file.
+
+# where the host and job registries live. the default is sync/registry/ inside
+# the checkout, which is gitignored.
+#DEFAULT_SYNC_REGISTRY_DIR="${HOME}/.config/rv_bashtools/sync"
+
+# override either registry file individually
+#DEFAULT_SYNC_HOSTS_FILE="${HOME}/.config/rv_bashtools/sync/hosts"
+#DEFAULT_SYNC_JOBS_FILE="${HOME}/.config/rv_bashtools/sync/jobs"
+
+# per-run log directories are created under here
+#DEFAULT_SYNC_LOG_DIR="${HOME}/.local/share/rv_bashtools/logs/sync"
+
+# concurrent rsync workers when running more than one job
+#DEFAULT_SYNC_WORKERS=4
+
+# role given to a host registered without --role
+#DEFAULT_SYNC_HOST_ROLE="both"
+
+# ssh port used for hosts registered without --port. empty lets ~/.ssh/config decide.
+#DEFAULT_SYNC_SSH_PORT=""
+
+# rsync binary to invoke
+#DEFAULT_SYNC_RSYNC="rsync"
+
+# rsync exit codes reported as success rather than failure
+#DEFAULT_SYNC_OK_EXIT_CODES=(0 24)
+
+# grace period in seconds between SIGTERM and SIGKILL on interrupt
+#DEFAULT_SYNC_KILL_GRACE=5
+
+# log verbosity: debug, info, warn, error
+#DEFAULT_LOG_LEVEL="info"

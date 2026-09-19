@@ -1,0 +1,15 @@
+# Example job registry. Copy to registry/jobs, or use `rsync-jobs job add`.
+#
+# name|src_host:path|dst_host:path|opts|tags
+#
+#   name    [A-Za-z0-9][A-Za-z0-9._-]*, unique, also used as the log filename
+#   src     host:path — the host must be registered, or the reserved name 'local'
+#   dst     host:path — one side must be local; rsync cannot do remote to remote
+#   opts    rsync flags, whitespace separated, no spaces inside a value
+#   tags    comma separated, used by `run --tag`
+#
+# Trailing slash on the source means "contents of", exactly as in plain rsync.
+
+photos-push|local:/srv/photos/|backup:/vol/photos/|-a --delete|daily,photos
+logs-pull|media:/var/log/|local:/arch/log/|-az|logs
+home-archive|local:/home/weezy/|backup:/vol/home/|-a --partial-dir=.rsync-partial|weekly
